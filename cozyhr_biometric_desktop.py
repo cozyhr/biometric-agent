@@ -2,26 +2,13 @@
 """
 CozyHR Biometric Sync — desktop utility.
 
-A simple cross-platform GUI (Tkinter) for connecting ESSL / ZKTeco IN/OUT
-fingerprint devices on your local network to CozyHR. It can:
-
-  • Test device connections
-  • Import enrolled users as employees (onboarding)
-  • Sync punches (incremental, baseline = now by default; optional backfill)
-  • Run continuously in the background
+Cross-platform GUI (Tkinter) to connect ESSL / ZKTeco IN/OUT fingerprint devices
+on your local network to CozyHR. Supports ANY number of devices (1, 2, 5, ...),
+each with its own direction (IN / OUT / BOTH).
 
 Run:
     pip install pyzk requests
     python cozyhr_biometric_desktop.py
-
-Package to a standalone app (optional):
-    pip install pyinstaller
-    pyinstaller --onefile --windowed --name "CozyHR Biometric Sync" cozyhr_biometric_desktop.py
-
-Notes learned from real ESSL devices:
-  • IN vs OUT comes from WHICH device a punch is on (the device 'punch' flag is
-    unreliable), so each device has a fixed direction.
-  • Some devices report bad clock timestamps (year 2000) — those are skipped.
 """
 
 import json
@@ -42,16 +29,16 @@ except ImportError:
 APP_DIR = os.path.join(os.path.expanduser("~"), ".cozyhr-agent")
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 STATE_FILE = os.path.join(APP_DIR, "state.json")
-AGENT_VERSION = "1.0.0-desktop"
+AGENT_VERSION = "1.1.0-desktop"
 MIN_VALID_YEAR = 2020
+DIRECTIONS = ["IN", "OUT", "BOTH"]
 
 DEFAULT_CONFIG = {
     "baseUrl": "https://cozyhr.com",
     "apiKey": "",
     "pollSeconds": 60,
     "devices": [
-        {"name": "IN Device", "ip": "192.168.29.201", "port": 4370, "direction": "IN", "deviceCode": "IN-201"},
-        {"name": "OUT Device", "ip": "192.168.29.202", "port": 4370, "direction": "OUT", "deviceCode": "OUT-202"},
+        {"name": "Main Device", "ip": "192.168.1.201", "port": 4370, "direction": "BOTH", "deviceCode": "DEV-1"},
     ],
 }
 
@@ -71,7 +58,7 @@ def save_json(path, data):
 
 
 class SyncCore:
-    """Headless logic shared by all buttons; logs through a callback."""
+    """Headless logic; logs through a callback. Works for any number of devices."""
 
     def __init__(self, config, log):
         self.config = config
@@ -81,19 +68,27 @@ class SyncCore:
         return {"Authorization": f"Bearer {self.config['apiKey'].strip()}", "Content-Type": "application/json"}
 
     def _connect(self, device):
-        zk = ZK(device["ip"], port=int(device.get("port") or 4370), timeout=8, ommit_ping=True)
-        return zk.connect()
+        return ZK(device["ip"], port=int(device.get("port") or 4370), timeout=8, ommit_ping=True).connect()
+
+    def fetch_remote_devices(self):
+        """Pull devices registered in CozyHR (Time -> Devices) for this tenant."""
+        base = self.config["baseUrl"].rstrip("/")
+        res = requests.get(f"{base}/api/public/v1/attendance/devices", headers=self.headers(), timeout=20)
+        res.raise_for_status()
+        out = []
+        for d in res.json().get("devices", []):
+            if d.get("ip"):
+                out.append({"name": d.get("name") or d["deviceCode"], "ip": d["ip"], "port": d.get("port") or 4370,
+                            "direction": (d.get("direction") or "BOTH").upper(), "deviceCode": d["deviceCode"]})
+        return out
 
     def test(self):
-        ok = True
         for device in self.config["devices"]:
             conn = None
             try:
                 conn = self._connect(device)
-                users = conn.get_users() or []
-                self.log(f"OK {device['name']} ({device['ip']}): connected — {len(users)} users enrolled.")
+                self.log(f"OK {device['name']} ({device['ip']}): connected, {len(conn.get_users() or [])} users.")
             except Exception as error:
-                ok = False
                 self.log(f"FAIL {device['name']} ({device['ip']}): {error}")
             finally:
                 if conn:
@@ -101,7 +96,6 @@ class SyncCore:
                         conn.disconnect()
                     except Exception:
                         pass
-        return ok
 
     def import_users(self):
         if not self.config["apiKey"].strip():
@@ -114,7 +108,7 @@ class SyncCore:
                 conn = self._connect(device)
                 users = conn.get_users() or []
             except Exception as error:
-                self.log(f"FAIL {device['name']}: could not read users: {error}")
+                self.log(f"FAIL {device['name']}: {error}")
                 continue
             finally:
                 if conn:
@@ -131,31 +125,27 @@ class SyncCore:
         if not payload:
             self.log("No enrolled users found.")
             return
-        self.log(f"Importing {len(payload)} user(s) as employees…")
+        self.log(f"Importing {len(payload)} user(s)...")
         created = skipped = 0
+        base = self.config["baseUrl"].rstrip("/")
         for start in range(0, len(payload), 200):
-            chunk = payload[start:start + 200]
-            try:
-                res = requests.post(f"{self.config['baseUrl'].rstrip('/')}/api/public/v1/employees", headers=self.headers(), json={"employees": chunk}, timeout=30)
-                data = res.json()
-            except requests.RequestException as error:
-                self.log(f"FAIL import failed: {error}")
-                return
+            res = requests.post(f"{base}/api/public/v1/employees", headers=self.headers(), json={"employees": payload[start:start + 200]}, timeout=30)
+            data = res.json()
             if res.status_code not in (200, 201):
                 self.log(f"FAIL import rejected ({res.status_code}): {str(data)[:200]}")
                 return
             created += int(data.get("created", 0))
             skipped += int(data.get("skipped", 0))
-        self.log(f"OK Users imported: {created} created, {skipped} already existed.")
+        self.log(f"OK Users imported: {created} created, {skipped} existed.")
 
     def sync_punches(self, state, baseline_now=True):
         if not self.config["apiKey"].strip():
             self.log("Set your API key first.")
             return
-        base_url = self.config["baseUrl"].rstrip("/")
+        base = self.config["baseUrl"].rstrip("/")
         for device in self.config["devices"]:
             code = device["deviceCode"]
-            direction = device["direction"].upper()
+            direction = (device.get("direction") or "BOTH").upper()
             last_iso = state.get(code)
             last_time = datetime.fromisoformat(last_iso) if last_iso else None
 
@@ -175,35 +165,29 @@ class SyncCore:
                     except Exception:
                         pass
 
-            # Drop bad-clock records; keep only newer than last sync.
             clean = [r for r in records if r.timestamp.year >= MIN_VALID_YEAR]
             if last_time is None and baseline_now:
-                # First run: baseline to the latest record so we don't push years of history.
                 state[code] = (max((r.timestamp for r in clean), default=datetime.now())).isoformat()
                 save_json(STATE_FILE, state)
-                self.log(f"{code}: baseline set ({len(clean)} historical records skipped). New punches will sync from now.")
+                self.log(f"{code}: baseline set ({len(clean)} old records skipped); new punches sync from now.")
                 continue
 
-            fresh = [r for r in clean if last_time is None or r.timestamp > last_time]
-            fresh.sort(key=lambda r: r.timestamp)
+            fresh = sorted([r for r in clean if last_time is None or r.timestamp > last_time], key=lambda r: r.timestamp)
             if not fresh:
                 self.log(f"{code}: no new punches.")
                 continue
-
-            newest = last_time
-            sent = 0
+            newest, sent = last_time, 0
             for record in fresh:
+                # Dedicated IN/OUT devices set direction; a BOTH device uses the device's punch flag.
+                punch_type = direction if direction in ("IN", "OUT") else ("OUT" if getattr(record, "punch", 0) else "IN")
                 try:
-                    res = requests.post(
-                        f"{base_url}/api/public/v1/attendance/punches",
-                        headers=self.headers(),
-                        json={"employeeCode": str(record.user_id), "punchType": direction, "punchTimestamp": record.timestamp.isoformat(), "deviceCode": code},
-                        timeout=20,
-                    )
+                    res = requests.post(f"{base}/api/public/v1/attendance/punches", headers=self.headers(),
+                                        json={"employeeCode": str(record.user_id), "punchType": punch_type,
+                                              "punchTimestamp": record.timestamp.isoformat(), "deviceCode": code}, timeout=20)
                 except requests.RequestException as error:
                     self.log(f"FAIL {code}: network error: {error}")
                     break
-                if res.status_code in (200, 201) or res.status_code == 404:
+                if res.status_code in (200, 201, 404):
                     if res.status_code != 404:
                         sent += 1
                     if newest is None or record.timestamp > newest:
@@ -214,16 +198,11 @@ class SyncCore:
             if newest is not None:
                 state[code] = newest.isoformat()
                 save_json(STATE_FILE, state)
-            self.log(f"OK {code}: pushed {sent}/{len(fresh)} punch(es).")
-
-        # Heartbeat (best-effort).
+            self.log(f"OK {code}: pushed {sent}/{len(fresh)}.")
         try:
-            requests.post(
-                f"{base_url}/api/public/v1/attendance/devices",
-                headers=self.headers(),
-                json={"agentId": f"desktop-{os.getpid()}", "agentVersion": AGENT_VERSION, "devices": [{"deviceCode": d["deviceCode"], "status": "OK"} for d in self.config["devices"]]},
-                timeout=15,
-            )
+            requests.post(f"{base}/api/public/v1/attendance/devices", headers=self.headers(),
+                          json={"agentId": f"desktop-{os.getpid()}", "agentVersion": AGENT_VERSION,
+                                "devices": [{"deviceCode": d["deviceCode"], "status": "OK"} for d in self.config["devices"]]}, timeout=15)
         except requests.RequestException:
             pass
 
@@ -232,44 +211,51 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("CozyHR Biometric Sync")
-        root.geometry("720x560")
+        root.geometry("780x640")
         self.config = {**DEFAULT_CONFIG, **load_json(CONFIG_FILE, DEFAULT_CONFIG)}
         self.state = load_json(STATE_FILE, {})
         self.log_queue: queue.Queue = queue.Queue()
         self.running = False
+        self.device_rows = []
         self._build()
         self._drain_logs()
 
     def _build(self):
-        pad = {"padx": 8, "pady": 4}
+        pad = {"padx": 6, "pady": 3}
         frm = ttk.Frame(self.root, padding=12)
         frm.pack(fill="both", expand=True)
 
-        ttk.Label(frm, text="CozyHR Biometric Sync", font=("Helvetica", 15, "bold")).grid(row=0, column=0, columnspan=3, sticky="w")
-        ttk.Label(frm, text="Connect your ESSL / ZKTeco IN & OUT devices to CozyHR.").grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        ttk.Label(frm, text="CozyHR Biometric Sync", font=("Helvetica", 15, "bold")).grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(frm, text="Connect any number of ESSL / ZKTeco devices to CozyHR.").grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
         ttk.Label(frm, text="CozyHR URL").grid(row=2, column=0, sticky="w", **pad)
-        self.base = ttk.Entry(frm, width=46)
+        self.base = ttk.Entry(frm, width=44)
         self.base.insert(0, self.config["baseUrl"])
-        self.base.grid(row=2, column=1, columnspan=2, sticky="we", **pad)
+        self.base.grid(row=2, column=1, columnspan=3, sticky="we", **pad)
 
         ttk.Label(frm, text="API key").grid(row=3, column=0, sticky="w", **pad)
-        self.key = ttk.Entry(frm, width=46, show="*")
+        self.key = ttk.Entry(frm, width=44, show="*")
         self.key.insert(0, self.config["apiKey"])
-        self.key.grid(row=3, column=1, columnspan=2, sticky="we", **pad)
+        self.key.grid(row=3, column=1, columnspan=3, sticky="we", **pad)
 
-        ttk.Label(frm, text="IN device IP").grid(row=4, column=0, sticky="w", **pad)
-        self.in_ip = ttk.Entry(frm, width=20)
-        self.in_ip.insert(0, self.config["devices"][0]["ip"])
-        self.in_ip.grid(row=4, column=1, sticky="w", **pad)
+        # Devices header
+        dev_head = ttk.Frame(frm)
+        dev_head.grid(row=4, column=0, columnspan=4, sticky="we", pady=(8, 0))
+        ttk.Label(dev_head, text="Devices", font=("Helvetica", 12, "bold")).pack(side="left")
+        ttk.Button(dev_head, text="+ Add device", command=lambda: self.add_device_row()).pack(side="left", padx=8)
+        ttk.Button(dev_head, text="Load from CozyHR", command=self.load_remote).pack(side="left")
 
-        ttk.Label(frm, text="OUT device IP").grid(row=5, column=0, sticky="w", **pad)
-        self.out_ip = ttk.Entry(frm, width=20)
-        self.out_ip.insert(0, self.config["devices"][1]["ip"])
-        self.out_ip.grid(row=5, column=1, sticky="w", **pad)
+        col = ttk.Frame(frm)
+        col.grid(row=5, column=0, columnspan=4, sticky="we")
+        for i, label in enumerate(["Name", "IP address", "Port", "Direction", "Code", ""]):
+            ttk.Label(col, text=label, font=("Helvetica", 9, "bold")).grid(row=0, column=i, padx=4, sticky="w")
+        self.devices_frame = ttk.Frame(frm)
+        self.devices_frame.grid(row=6, column=0, columnspan=4, sticky="we")
+        for device in self.config["devices"]:
+            self.add_device_row(device)
 
         btns = ttk.Frame(frm)
-        btns.grid(row=6, column=0, columnspan=3, sticky="w", pady=8)
+        btns.grid(row=7, column=0, columnspan=4, sticky="w", pady=10)
         ttk.Button(btns, text="Save", command=self.save).pack(side="left", padx=4)
         ttk.Button(btns, text="Test devices", command=lambda: self.run_async(self.core().test)).pack(side="left", padx=4)
         ttk.Button(btns, text="Import users", command=lambda: self.run_async(self.core().import_users)).pack(side="left", padx=4)
@@ -277,26 +263,77 @@ class App:
         self.auto_btn = ttk.Button(btns, text="Start auto-sync", command=self.toggle_auto)
         self.auto_btn.pack(side="left", padx=4)
 
-        self.logbox = tk.Text(frm, height=18, width=86, state="disabled", wrap="word")
-        self.logbox.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
-        frm.rowconfigure(7, weight=1)
+        self.logbox = tk.Text(frm, height=12, state="disabled", wrap="word")
+        self.logbox.grid(row=8, column=0, columnspan=4, sticky="nsew", pady=(6, 0))
+        frm.rowconfigure(8, weight=1)
         frm.columnconfigure(1, weight=1)
-        self.log("Ready. Save your settings, then Test devices.")
+        self.log("Ready. Add your devices, Save, then Test devices.")
+
+    def add_device_row(self, device=None):
+        device = device or {"name": "", "ip": "", "port": 4370, "direction": "BOTH", "deviceCode": ""}
+        row = ttk.Frame(self.devices_frame)
+        row.pack(fill="x", pady=2)
+        name = ttk.Entry(row, width=16); name.insert(0, device.get("name", "")); name.grid(row=0, column=0, padx=2)
+        ip = ttk.Entry(row, width=16); ip.insert(0, device.get("ip", "")); ip.grid(row=0, column=1, padx=2)
+        port = ttk.Entry(row, width=6); port.insert(0, str(device.get("port", 4370))); port.grid(row=0, column=2, padx=2)
+        direction = ttk.Combobox(row, width=7, values=DIRECTIONS, state="readonly")
+        direction.set(device.get("direction", "BOTH")); direction.grid(row=0, column=3, padx=2)
+        code = ttk.Entry(row, width=12); code.insert(0, device.get("deviceCode", "")); code.grid(row=0, column=4, padx=2)
+        entry = {"frame": row, "name": name, "ip": ip, "port": port, "direction": direction, "code": code}
+        ttk.Button(row, text="Remove", width=8, command=lambda: self.remove_device_row(entry)).grid(row=0, column=5, padx=2)
+        self.device_rows.append(entry)
+
+    def remove_device_row(self, entry):
+        entry["frame"].destroy()
+        self.device_rows.remove(entry)
+
+    def read_devices(self):
+        devices = []
+        for r in self.device_rows:
+            ip = r["ip"].get().strip()
+            if not ip:
+                continue
+            devices.append({
+                "name": r["name"].get().strip() or ip,
+                "ip": ip,
+                "port": int(r["port"].get().strip() or 4370),
+                "direction": r["direction"].get() or "BOTH",
+                "deviceCode": r["code"].get().strip() or ip.replace(".", "-"),
+            })
+        return devices
 
     def core(self):
-        self._sync_config_from_form()
-        return SyncCore(self.config, self.log)
-
-    def _sync_config_from_form(self):
         self.config["baseUrl"] = self.base.get().strip()
         self.config["apiKey"] = self.key.get().strip()
-        self.config["devices"][0]["ip"] = self.in_ip.get().strip()
-        self.config["devices"][1]["ip"] = self.out_ip.get().strip()
+        self.config["devices"] = self.read_devices()
+        return SyncCore(self.config, self.log)
+
+    def load_remote(self):
+        def work():
+            try:
+                remote = self.core().fetch_remote_devices()
+            except Exception as error:
+                self.log(f"Could not load devices from CozyHR: {error}")
+                return
+            if not remote:
+                self.log("No devices with an IP found in CozyHR (add them in Time -> Devices).")
+                return
+            self.root.after(0, lambda: self._replace_devices(remote))
+        self.run_async(work)
+
+    def _replace_devices(self, devices):
+        for entry in list(self.device_rows):
+            self.remove_device_row(entry)
+        for device in devices:
+            self.add_device_row(device)
+        self.log(f"Loaded {len(devices)} device(s) from CozyHR.")
 
     def save(self):
-        self._sync_config_from_form()
+        self.config["baseUrl"] = self.base.get().strip()
+        self.config["apiKey"] = self.key.get().strip()
+        self.config["devices"] = self.read_devices()
         save_json(CONFIG_FILE, self.config)
-        self.log("Settings saved.")
+        self.log(f"Settings saved ({len(self.config['devices'])} device(s)).")
 
     def log(self, message):
         self.log_queue.put(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
