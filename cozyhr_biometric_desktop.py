@@ -82,6 +82,28 @@ class SyncCore:
                             "direction": (d.get("direction") or "BOTH").upper(), "deviceCode": d["deviceCode"]})
         return out
 
+    def register_devices(self):
+        """Push the configured devices to CozyHR so they appear in Time -> Devices with live status."""
+        if not self.config["apiKey"].strip():
+            return
+        base = self.config["baseUrl"].rstrip("/")
+        payload = [{
+            "deviceCode": d["deviceCode"], "name": d.get("name") or d["deviceCode"], "ip": d["ip"],
+            "port": int(d.get("port") or 4370), "direction": (d.get("direction") or "BOTH").upper(), "status": "OK",
+        } for d in self.config["devices"] if d.get("ip")]
+        if not payload:
+            return
+        try:
+            res = requests.post(f"{base}/api/public/v1/attendance/devices", headers=self.headers(),
+                                json={"agentId": f"desktop-{os.getpid()}", "agentVersion": AGENT_VERSION, "devices": payload}, timeout=20)
+            if res.status_code in (200, 201):
+                data = res.json()
+                self.log(f"OK Registered devices in CozyHR ({data.get('created', 0)} new, {data.get('updated', 0)} updated).")
+            else:
+                self.log(f"Could not register devices in CozyHR ({res.status_code}).")
+        except requests.RequestException as error:
+            self.log(f"Could not register devices in CozyHR: {error}")
+
     def test(self):
         for device in self.config["devices"]:
             conn = None
@@ -96,6 +118,8 @@ class SyncCore:
                         conn.disconnect()
                     except Exception:
                         pass
+        # Devices that connected: register them in CozyHR so they show in Time -> Devices.
+        self.register_devices()
 
     def import_users(self):
         if not self.config["apiKey"].strip():
@@ -198,12 +222,7 @@ class SyncCore:
                 state[code] = newest.isoformat()
                 save_json(STATE_FILE, state)
             self.log(f"OK {code}: pushed {sent}/{len(fresh)}.")
-        try:
-            requests.post(f"{base}/api/public/v1/attendance/devices", headers=self.headers(),
-                          json={"agentId": f"desktop-{os.getpid()}", "agentVersion": AGENT_VERSION,
-                                "devices": [{"deviceCode": d["deviceCode"], "status": "OK"} for d in self.config["devices"]]}, timeout=15)
-        except requests.RequestException:
-            pass
+        self.register_devices()
 
 
 class App:
