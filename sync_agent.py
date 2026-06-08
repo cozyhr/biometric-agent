@@ -154,7 +154,11 @@ def sync_device(device: dict, state: dict) -> dict:
             except Exception:
                 pass
 
-    fresh = [r for r in records if last_time is None or r.timestamp > last_time]
+    # Drop bad-clock records (year < 2020); on first run, baseline to start of today.
+    clean = [r for r in records if r.timestamp.year >= 2020]
+    if last_time is None:
+        last_time = datetime.combine(datetime.now().date(), datetime.min.time())
+    fresh = [r for r in clean if r.timestamp > last_time]
     fresh.sort(key=lambda r: r.timestamp)
     if not fresh:
         log(f"{code}: no new punches.")

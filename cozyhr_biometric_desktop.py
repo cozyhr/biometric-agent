@@ -167,10 +167,9 @@ class SyncCore:
 
             clean = [r for r in records if r.timestamp.year >= MIN_VALID_YEAR]
             if last_time is None and baseline_now:
-                state[code] = (max((r.timestamp for r in clean), default=datetime.now())).isoformat()
-                save_json(STATE_FILE, state)
-                self.log(f"{code}: baseline set ({len(clean)} old records skipped); new punches sync from now.")
-                continue
+                # First run: sync from the START OF TODAY (skip old history, keep today's punches).
+                last_time = datetime.combine(datetime.now().date(), datetime.min.time())
+                self.log(f"{code}: first run — syncing today's punches (from {last_time.date()}).")
 
             fresh = sorted([r for r in clean if last_time is None or r.timestamp > last_time], key=lambda r: r.timestamp)
             if not fresh:
