@@ -21,3 +21,21 @@ Each release publishes ready-to-run binaries for macOS, Windows and Linux on the
 ## What you need
 1. A CozyHR API key (Developers -> API keys; scopes attendance.read, attendance.write, employees.write).
 2. This machine on the same LAN as the devices (ZK devices use TCP port 4370).
+
+## Backfill a date range (re-pull history)
+Need older punches, or to re-import a day? Sync a specific window — this pulls
+**every** punch in that range still on the device and **does not touch** the
+incremental cursor, so normal auto-sync keeps working afterwards.
+
+CLI:
+```bash
+python sync_agent.py --from 2026-06-08                 # from that date 00:00 to now
+python sync_agent.py --from 2026-06-08 --to 2026-06-10 # an explicit window
+python sync_agent.py --from 2026-06-11T09:00           # date + time also accepted
+```
+
+Desktop app: use the **Backfill range** row — enter *From* / *To* (`YYYY-MM-DD`)
+and click **Sync range**.
+
+> Only data still in the device's memory can be backfilled — eSSL/ZKTeco units
+> overwrite the oldest punches once full.

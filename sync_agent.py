@@ -35,7 +35,7 @@ try:
 except ImportError:
     sys.exit("Missing dependencies. Run: pip install pyzk requests")
 
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.2.0"
 BASE_URL = os.environ.get("COZY_BASE_URL", "https://cozyhr.com").rstrip("/")
 API_KEY = os.environ.get("COZY_API_KEY", "").strip()
 POLL_SECONDS = int(os.environ.get("COZY_POLL_SECONDS", "60"))
@@ -130,8 +130,14 @@ def send_heartbeat(statuses: list[dict]) -> None:
         log(f"heartbeat failed: {error}")
 
 
-def sync_device(device: dict, state: dict) -> dict:
-    """Sync one device and return its heartbeat status entry."""
+def sync_device(device: dict, state: dict, window: "tuple[datetime, datetime] | None" = None) -> dict:
+    """Sync one device and return its heartbeat status entry.
+
+    Normal mode (window=None): incremental — push punches newer than the saved
+    per-device cursor, then advance the cursor.
+    Backfill mode (window=(from, to)): push every punch in that date/time range,
+    ignoring and NOT touching the cursor, so normal sync keeps working after.
+    """
     code = device.get("deviceCode") or device.get("device_code") or device.get("ip")
     direction = (device.get("direction") or "BOTH").upper()
     last_iso = state.get(code)
@@ -154,17 +160,22 @@ def sync_device(device: dict, state: dict) -> dict:
             except Exception:
                 pass
 
-    # Drop bad-clock records (year < 2020); on first run, baseline to start of today.
+    # Drop bad-clock records (year < 2020).
     clean = [r for r in records if r.timestamp.year >= 2020]
-    if last_time is None:
-        last_time = datetime.combine(datetime.now().date(), datetime.min.time())
-    fresh = [r for r in clean if r.timestamp > last_time]
+    if window is not None:
+        from_dt, to_dt = window
+        fresh = [r for r in clean if from_dt <= r.timestamp <= to_dt]
+    else:
+        # On first run, baseline to start of today.
+        if last_time is None:
+            last_time = datetime.combine(datetime.now().date(), datetime.min.time())
+        fresh = [r for r in clean if r.timestamp > last_time]
     fresh.sort(key=lambda r: r.timestamp)
     if not fresh:
-        log(f"{code}: no new punches.")
-        return {"deviceCode": code, "status": "OK", "message": "No new punches"}
+        log(f"{code}: no punches in range." if window else f"{code}: no new punches.")
+        return {"deviceCode": code, "status": "OK", "message": "No punches in range" if window else "No new punches"}
 
-    log(f"{code}: {len(fresh)} new punch(es).")
+    log(f"{code}: {len(fresh)} punch(es) to push{' (backfill)' if window else ''}.")
     newest = last_time
     sent = 0
     for record in fresh:
@@ -176,11 +187,34 @@ def sync_device(device: dict, state: dict) -> dict:
                 newest = record.timestamp
         else:
             break
-    if newest is not None:
+    # Backfill never moves the incremental cursor (it would skip future punches).
+    if window is None and newest is not None:
         state[code] = newest.isoformat()
         save_state(state)
     log(f"{code}: pushed {sent}/{len(fresh)}.")
     return {"deviceCode": code, "status": "OK", "message": f"Pushed {sent}/{len(fresh)}"}
+
+
+def parse_when(value: str, end_of_day: bool = False) -> datetime:
+    """Parse 'YYYY-MM-DD' or full ISO ('YYYY-MM-DDTHH:MM[:SS]'). Date-only maps to
+    start of day, or end of day when end_of_day=True."""
+    text = value.strip()
+    if len(text) == 10:  # date only
+        text += "T23:59:59" if end_of_day else "T00:00:00"
+    return datetime.fromisoformat(text)
+
+
+def run_backfill(from_dt: datetime, to_dt: datetime) -> None:
+    if not API_KEY:
+        sys.exit("COZY_API_KEY is not set.")
+    state = load_state()
+    devices = fetch_devices()
+    if not devices:
+        log("No devices configured. Register them in CozyHR -> Time -> Devices, then re-run.")
+        return
+    log(f"Backfill {from_dt.isoformat()} .. {to_dt.isoformat()} across {len(devices)} device(s).")
+    statuses = [sync_device(device, state, window=(from_dt, to_dt)) for device in devices]
+    send_heartbeat(statuses)
 
 
 def sync_users() -> None:
@@ -254,11 +288,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="CozyHR local biometric sync agent")
     parser.add_argument("--once", action="store_true", help="Run a single sync pass and exit (use with cron).")
     parser.add_argument("--sync-users", action="store_true", help="Import enrolled device users as employees (onboarding), then exit.")
+    parser.add_argument("--from", dest="from_when", metavar="YYYY-MM-DD[THH:MM]", help="Backfill: push ALL device punches from this date/time (ignores the incremental cursor).")
+    parser.add_argument("--to", dest="to_when", metavar="YYYY-MM-DD[THH:MM]", help="Backfill end (default: now).")
     args = parser.parse_args()
 
     log(f"CozyHR biometric agent {AGENT_VERSION} (agentId={AGENT_ID}) -> {BASE_URL}")
     if args.sync_users:
         sync_users()
+        return
+    if args.from_when:
+        from_dt = parse_when(args.from_when)
+        to_dt = parse_when(args.to_when, end_of_day=True) if args.to_when else datetime.now()
+        run_backfill(from_dt, to_dt)
         return
     if args.once:
         run_once()

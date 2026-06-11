@@ -162,7 +162,9 @@ class SyncCore:
             skipped += int(data.get("skipped", 0))
         self.log(f"OK Users imported: {created} created, {skipped} existed.")
 
-    def sync_punches(self, state, baseline_now=True):
+    def sync_punches(self, state, baseline_now=True, window=None):
+        """window=(from, to): backfill that range, ignoring/not touching the
+        per-device cursor. window=None: normal incremental sync."""
         if not self.config["apiKey"].strip():
             self.log("Set your API key first.")
             return
@@ -190,14 +192,18 @@ class SyncCore:
                         pass
 
             clean = [r for r in records if r.timestamp.year >= MIN_VALID_YEAR]
-            if last_time is None and baseline_now:
-                # First run: sync from the START OF TODAY (skip old history, keep today's punches).
-                last_time = datetime.combine(datetime.now().date(), datetime.min.time())
-                self.log(f"{code}: first run — syncing today's punches (from {last_time.date()}).")
-
-            fresh = sorted([r for r in clean if last_time is None or r.timestamp > last_time], key=lambda r: r.timestamp)
+            if window is not None:
+                from_dt, to_dt = window
+                fresh = sorted([r for r in clean if from_dt <= r.timestamp <= to_dt], key=lambda r: r.timestamp)
+                self.log(f"{code}: backfill {from_dt.date()} .. {to_dt.date()} — {len(fresh)} punch(es).")
+            else:
+                if last_time is None and baseline_now:
+                    # First run: sync from the START OF TODAY (skip old history, keep today's punches).
+                    last_time = datetime.combine(datetime.now().date(), datetime.min.time())
+                    self.log(f"{code}: first run — syncing today's punches (from {last_time.date()}).")
+                fresh = sorted([r for r in clean if last_time is None or r.timestamp > last_time], key=lambda r: r.timestamp)
             if not fresh:
-                self.log(f"{code}: no new punches.")
+                self.log(f"{code}: no punches in range." if window else f"{code}: no new punches.")
                 continue
             newest, sent = last_time, 0
             for record in fresh:
@@ -218,7 +224,8 @@ class SyncCore:
                 else:
                     self.log(f"FAIL {code}: rejected ({res.status_code}) {res.text[:120]}")
                     break
-            if newest is not None:
+            # Backfill never moves the incremental cursor (it would skip future punches).
+            if window is None and newest is not None:
                 state[code] = newest.isoformat()
                 save_json(STATE_FILE, state)
             self.log(f"OK {code}: pushed {sent}/{len(fresh)}.")
@@ -281,9 +288,23 @@ class App:
         self.auto_btn = ttk.Button(btns, text="Start auto-sync", command=self.toggle_auto)
         self.auto_btn.pack(side="left", padx=4)
 
-        self.logbox = tk.Text(frm, height=12, state="disabled", wrap="word")
-        self.logbox.grid(row=8, column=0, columnspan=4, sticky="nsew", pady=(6, 0))
-        frm.rowconfigure(8, weight=1)
+        # Backfill a date range (pull all punches still on the device for those days).
+        back = ttk.Frame(frm)
+        back.grid(row=8, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        ttk.Label(back, text="Backfill range  From").pack(side="left", padx=(0, 4))
+        self.from_entry = ttk.Entry(back, width=12)
+        self.from_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
+        self.from_entry.pack(side="left")
+        ttk.Label(back, text="To").pack(side="left", padx=4)
+        self.to_entry = ttk.Entry(back, width=12)
+        self.to_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
+        self.to_entry.pack(side="left")
+        ttk.Label(back, text="(YYYY-MM-DD)").pack(side="left", padx=4)
+        ttk.Button(back, text="Sync range", command=self.backfill_range).pack(side="left", padx=8)
+
+        self.logbox = tk.Text(frm, height=11, state="disabled", wrap="word")
+        self.logbox.grid(row=9, column=0, columnspan=4, sticky="nsew", pady=(6, 0))
+        frm.rowconfigure(9, weight=1)
         frm.columnconfigure(1, weight=1)
         self.log("Ready. Add your devices, Save, then Test devices.")
 
@@ -352,6 +373,25 @@ class App:
         self.config["devices"] = self.read_devices()
         save_json(CONFIG_FILE, self.config)
         self.log(f"Settings saved ({len(self.config['devices'])} device(s)).")
+
+    @staticmethod
+    def _parse_when(value, end_of_day=False):
+        text = value.strip()
+        if len(text) == 10:  # date only
+            text += "T23:59:59" if end_of_day else "T00:00:00"
+        return datetime.fromisoformat(text)
+
+    def backfill_range(self):
+        try:
+            from_dt = self._parse_when(self.from_entry.get())
+            to_dt = self._parse_when(self.to_entry.get(), end_of_day=True)
+        except ValueError:
+            self.log("Backfill: enter valid dates as YYYY-MM-DD (or YYYY-MM-DDTHH:MM).")
+            return
+        if to_dt < from_dt:
+            self.log("Backfill: 'To' must be on or after 'From'.")
+            return
+        self.run_async(lambda: self.core().sync_punches(self.state, window=(from_dt, to_dt)))
 
     def log(self, message):
         self.log_queue.put(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
